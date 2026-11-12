@@ -1,1 +1,1 @@
-appli 6.0.1 — source livraison/outillage 1835ffe
+appli 7.0 — source lot-7 be06a02
