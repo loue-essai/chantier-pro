@@ -128,7 +128,7 @@
       var plafond = Math.min(C.PLAFOND, ix.total + libre - C.MARGE);
       if (ix.total + besoin <= plafond) return true;
       var anciennes = Object.keys(ix.lignes).map(function (k) { return ix.lignes[k]; })
-        .filter(function (l) { return !protege || l.cle.indexOf(protege) !== 0; })
+        .filter(function (l) { return (!protege || l.cle.indexOf(protege) !== 0) && !(completsProteges && completsProteges[l.chantier + '|' + l.doc]); })
         .sort(function (a, b) { return (a.vu || 0) - (b.vu || 0); });
       var aRetirer = [], gagne = 0;
       // retirer une image du carnet libère autant de place dans le téléphone : le plafond ne bouge pas
@@ -137,6 +137,9 @@
       return supprimer(aRetirer).then(function () { return true; });
     });
   }
+  // Pendant un « Tout télécharger » : les documents téléchargés en entier (« chantier|document » → true) ne sont pas
+  // chassés pour faire de la place — sinon deux gros documents se chasseraient l'un l'autre sans fin.
+  var completsProteges = null;
   // Garde une image. Ne lève jamais d'erreur : si le téléphone ne peut pas la garder, elle est seulement affichée.
   C.pleinLe = 0;
   function garder(chantier, doc, page, quoi, octets) {
@@ -212,6 +215,13 @@
   //    été ouvert sur ce téléphone — une barre de réseau ne doit pas laisser le poseur sans aucun plan ;
   //  - liste vide alors que la précédente ne l'était pas (dossier renommé ou déplacé dans le Drive, par exemple) : la
   //    liste gardée reste affichée, avec un message, et rien n'est effacé tant que cela ne dure pas depuis 24 heures.
+  // Les marques « téléchargé en entier » : { 'complet|chantier|document': { empreinte, date } }
+  function marques() {
+    return transaction(['meta'], 'readonly', function (m) { return m('meta').getAll(); }).then(function (t) {
+      var r = {}; (t || []).forEach(function (e) { if (String(e.cle).indexOf('complet|') === 0) r[e.cle] = e; });
+      return r;
+    }).catch(function () { return {}; });
+  }
   var majConnue = {};   // date de la liste du serveur, par chantier, telle que ce téléphone l'a reçue pendant cette visite
   // quand un document a été déposé (instant du dépôt s'il est connu, sinon son jour)
   function quand(d) { return /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/.test(String(d.empreinte || '')) ? String(d.empreinte) : String(d.date || ''); }
@@ -236,15 +246,22 @@
         });
       }
     }
-    return index().then(function (ix) {
-      var apercuGarde = function (id) { return !!(ix.lignes[k + '|' + id + '|1|leger'] || ix.lignes[k + '|' + id + '|1|net']); };
+    return Promise.all([index(), marques()]).then(function (lus) {
+      var ix = lus[0], complets = lus[1];
+      var entier = function (id) { return !!complets['complet|' + k + '|' + id]; };
+      // « prêt » : le nouvel indice peut remplacer l'ancien. Si l'ancien avait été téléchargé en entier, le nouveau doit
+      // l'être aussi (un téléchargement interrompu ne doit pas échanger un plan complet contre un plan incomplet).
+      var apercuGarde = function (id, ancienId) {
+        if (ancienId && entier(ancienId)) return entier(id);
+        return !!(ix.lignes[k + '|' + id + '|1|leger'] || ix.lignes[k + '|' + id + '|1|net']);
+      };
       var presents = {}, effaces = {}, anciens = [];
       recus.forEach(function (d) { presents[d.id] = d; });
       avant.forEach(function (a) {
         var neuf = presents[a.id];
         if (neuf) { if (String(a.empreinte || '') !== String(neuf.empreinte || '')) effaces[a.id] = true; return; }
         var remplacant = a.code ? recus.filter(function (d) { return d.code === a.code; })[0] : null;
-        if (remplacant && quand(remplacant) > quand(a) && apercuGarde(a.id) && !apercuGarde(remplacant.id)) anciens.push(Object.assign({}, a, { ancien: true, remplacePar: remplacant.indice || '' }));
+        if (remplacant && quand(remplacant) > quand(a) && apercuGarde(a.id) && !apercuGarde(remplacant.id, a.id)) anciens.push(Object.assign({}, a, { ancien: true, remplacePar: remplacant.indice || '' }));
       });
       var gardes = {}; anciens.forEach(function (a) { gardes[a.id] = true; });
       var docs = recus.concat(anciens);
@@ -364,5 +381,161 @@
       };
       return Promise.all(lots.map(function (l) { return demander(l, 0); })).then(function () { return bilan; });
     });
+  };
+
+  // ═══════════════ Lot 4b : hors réseau complet ═══════════════
+  // « Tout télécharger » va chercher TOUTES les images d'un document (aperçus et tuiles de chaque niveau), une seule
+  // demande à la fois (le serveur est partagé par toute l'entreprise), par lots d'environ 1,2 Mo. Il s'arrête sur
+  // demande, reprend où il en était (ce qui est gardé n'est jamais redemandé), et s'arrête de lui-même si le carnet
+  // n'a plus de place — les fiches passent toujours avant.
+  C.LOT_MASSE = 1200 * 1024;   // octets d'images par demande (le serveur en accepte 1 500 Ko)
+  C.TUILES_MASSE = 60;         // tuiles par demande (le serveur en accepte 64)
+  // Toutes les images d'un document : [{ page, quoi, o, niveau, c, l }]
+  function imagesDe(d) {
+    var t = [];
+    (d.pages || []).forEach(function (p, i) {
+      ['leger', 'net'].forEach(function (q) { if (p[q] && p[q].f) t.push({ page: i + 1, quoi: q, o: Number(p[q].o) || 0 }); });
+      (p.niveaux || []).forEach(function (nv) {
+        (nv.paquets || []).forEach(function (pq) {
+          (pq.tuiles || []).forEach(function (tu) { t.push({ page: i + 1, quoi: 'z' + nv.z + ':' + tu[0] + ',' + tu[1], o: Number(tu[3]) || 0, niveau: nv.z, c: tu[0], l: tu[1] }); });
+        });
+      });
+    });
+    return t;
+  }
+  function cleComplet(chantier, id) { return 'complet|' + cleChantier(chantier) + '|' + id; }
+  // Où en est un document : { total, gardees, octets, octetsGardes, complet, etaitComplet }
+  //  - complet : toutes ses images sont dans le téléphone ;
+  //  - etaitComplet : il a été téléchargé en entier (ce dépôt-là) ; s'il ne l'est plus, le téléphone a fait du ménage.
+  C.bilan = function (chantier, d) {
+    return index().then(function (ix) {
+      return transaction(['meta'], 'readonly', function (m) { return m('meta').get(cleComplet(chantier, d.id)); }).catch(function () { return null; }).then(function (marque) {
+        var b = { total: 0, gardees: 0, octets: 0, octetsGardes: 0 };
+        imagesDe(d).forEach(function (im) {
+          b.total++; b.octets += im.o;
+          if (ix.lignes[cleImage(chantier, d.id, im.page, im.quoi)]) { b.gardees++; b.octetsGardes += im.o; }
+        });
+        b.complet = b.total > 0 && b.gardees === b.total;
+        b.etaitComplet = !!marque && String(marque.empreinte || '') === String(d.empreinte || '');
+        return b;
+      });
+    }).catch(function () { return { total: 0, gardees: 0, octets: 0, octetsGardes: 0, complet: false, etaitComplet: false }; });
+  };
+  var enCoursMasse = null;   // { arret } : un seul téléchargement complet à la fois
+  C.telechargementEnCours = function () { return !!enCoursMasse; };
+  C.arreterTelechargement = function () { if (enCoursMasse) enCoursMasse.arret = true; };
+  function attendreMs(ms) { return new Promise(function (ok) { setTimeout(ok, ms); }); }
+  // Une demande « de masse », reprise deux fois si le serveur est occupé (attente au hasard : tous les téléphones ne
+  // reviennent pas à la même seconde)
+  // (trop de demandes en même temps : Google rend une page d'erreur ; coupure de réseau : rien du tout)
+  C.ATTENTE_REPRISE = 5000;
+  function demanderMasse(corps, moiMeme, essai) {
+    var encore = function () { return attendreMs(C.ATTENTE_REPRISE * (1 + Math.random() * 2)).then(function () { return moiMeme.arret ? null : demanderMasse(corps, moiMeme, (essai || 0) + 1); }); };
+    return LOUE.appeler(corps, 90000).then(function (rep) {
+      if (rep && rep.code === 'SERVEUR_OCCUPE' && (essai || 0) < 2) return encore();
+      return rep;
+    }, function (err) {
+      if ((essai || 0) < 2 && !moiMeme.arret) return encore();
+      throw err;
+    });
+  }
+  // Télécharge tout ce qui manque d'un document. « progres(octetsGardes, octets) » est appelé au fil de l'eau.
+  // Rend { fini, arrete, plein, erreur } (jamais de rejet) ; « erreur » porte le message à montrer.
+  C.telecharger = function (chantier, d, progres) {
+    if (enCoursMasse) return Promise.resolve({ fini: false, erreur: 'Un téléchargement est déjà en cours.' });
+    // Sans liste reçue du serveur pendant cette visite, on ne sait pas si le document a changé : on ne télécharge pas
+    if (!majConnue[cleChantier(chantier)]) return Promise.resolve({ fini: false, erreur: 'Actualisez la liste avant de télécharger (il faut du réseau).' });
+    var moiMeme = enCoursMasse = { arret: false };
+    var finir = function (r) { if (enCoursMasse === moiMeme) { enCoursMasse = null; completsProteges = null; } return r; };
+    return Promise.all([index(), marques(), placeLibre()]).then(function (lus) {
+      var ix = lus[0], complets = lus[1], libre = lus[2];
+      var toutes = imagesDe(d), fait = 0, total = 0, besoin = 0;
+      var manque = toutes.filter(function (im) {
+        total += im.o;
+        if (ix.lignes[cleImage(chantier, d.id, im.page, im.quoi)]) { fait += im.o; return false; }
+        besoin += im.o;
+        return true;
+      });
+      // Les documents téléchargés en entier sont protégés pendant ce téléchargement ; la place se compte AVANT de
+      // commencer : ce qui peut être chassé, ce sont les images des documents seulement « déjà ouverts ».
+      var proteges = {}, k = cleChantier(chantier);
+      Object.keys(complets).forEach(function (c) { proteges[c.slice('complet|'.length)] = true; });
+      var liberable = 0;
+      Object.keys(ix.lignes).forEach(function (c) { var l = ix.lignes[c]; if (!proteges[l.chantier + '|' + l.doc] && !(l.chantier === k && l.doc === d.id)) liberable += l.o || 0; });
+      var plafond = Math.min(C.PLAFOND, ix.total + libre - C.MARGE);
+      if (ix.total - liberable + besoin > plafond) return { fini: false, plein: true, avant: true, besoin: besoin, place: Math.max(0, plafond - (ix.total - liberable)) };
+      completsProteges = proteges;
+      var dire = function () { try { if (progres) progres(fait, total); } catch (e) {} };
+      dire();
+      // les lots : chaque aperçu seul ; les tuiles d'une même page et d'un même niveau ensemble, jusqu'à la taille d'un lot
+      var lots = [];
+      manque.filter(function (im) { return im.niveau === undefined; }).forEach(function (im) { lots.push({ page: im.page, quoi: im.quoi, images: [im] }); });
+      var courant = null;
+      manque.filter(function (im) { return im.niveau !== undefined; }).forEach(function (im) {
+        if (!courant || courant.page !== im.page || courant.niveau !== im.niveau || courant.o + im.o > C.LOT_MASSE || courant.images.length >= C.TUILES_MASSE) {
+          courant = { page: im.page, quoi: 'tuiles', niveau: im.niveau, images: [], o: 0 }; lots.push(courant);
+        }
+        courant.images.push(im); courant.o += im.o;
+      });
+      var suivant = function () {
+        if (moiMeme.arret) return { fini: false, arrete: true };
+        var lot = lots.shift();
+        if (!lot) return null;
+        var corps = { action: 'carnetTuiles', chantier: chantier, doc: d.id, page: lot.page, quoi: lot.quoi, masse: true };
+        if (lot.quoi === 'tuiles') { corps.niveau = lot.niveau; corps.tuiles = lot.images.map(function (im) { return [im.c, im.l]; }); }
+        return demanderMasse(corps, moiMeme).then(function (rep) {
+          if (!rep) return { fini: false, arrete: true };
+          if (!rep || !rep.ok) return { fini: false, erreur: (rep && rep.message) || 'Le serveur ne répond pas.', reponse: rep };
+          if (listeChangee(chantier, rep)) return { fini: false, erreur: CHANGE.message, reponse: CHANGE };
+          var recues = rep.data.images || [];
+          if (!recues.length) return { fini: false, erreur: 'Le serveur n’a rien rendu pour une partie du document : réessayez plus tard.' };
+          // rangées l'une après l'autre : si le carnet n'a plus de place, on s'arrête là
+          var ranger = function (i) {
+            if (i >= recues.length) return Promise.resolve(true);
+            var im = recues[i], quoi = lot.quoi === 'tuiles' ? 'z' + lot.niveau + ':' + im.c + ',' + im.l : lot.quoi, octets = octetsDe(im.b64);
+            return garder(chantier, d.id, lot.page, quoi, octets).then(function (gardee) {
+              if (!gardee) return false;
+              fait += octets.byteLength; dire();
+              return ranger(i + 1);
+            });
+          };
+          return ranger(0).then(function (place) {
+            if (!place) return { fini: false, plein: true };
+            // ce que le serveur n'a pas rendu cette fois (plafond par réponse) repart en tête
+            var reste = rep.data.reste || [];
+            if (lot.quoi === 'tuiles' && reste.length) {
+              var cles = {}; reste.forEach(function (t) { cles[t[0] + ',' + t[1]] = true; });
+              lots.unshift({ page: lot.page, quoi: 'tuiles', niveau: lot.niveau, o: 0, images: lot.images.filter(function (im) { return cles[im.c + ',' + im.l]; }) });
+            }
+            return suivant();
+          });
+        });
+      };
+      return Promise.resolve(suivant()).then(function (r) {
+        if (r) return r;
+        // La file est vide : on vérifie que TOUT y est vraiment avant de le dire et de le noter (la marque sert à dire
+        // plus tard « plus disponible » si le téléphone fait du ménage)
+        return C.bilan(chantier, d).then(function (b) {
+          if (!b.complet) return { fini: false, erreur: 'Le document n’a pas pu être téléchargé en entier (' + b.gardees + ' images sur ' + b.total + ') : réessayez.' };
+          return transaction(['meta'], 'readwrite', function (m) { m('meta').put({ cle: cleComplet(chantier, d.id), empreinte: String(d.empreinte || ''), date: Date.now() }); })
+            .catch(function () {}).then(function () { return { fini: true }; });
+        });
+      });
+    }).then(finir, function (err) { return finir({ fini: false, erreur: LOUE.messageClair ? LOUE.messageClair(err) : 'Pas de réseau.' }); });
+  };
+
+  // ── Wi-Fi : seul Chrome sur Android sait dire si le téléphone est en Wi-Fi ──
+  C.saitWifi = function () { var c = navigator.connection; return !!c && typeof c.type === 'string' && c.type !== ''; };
+  C.wifi = function () { var c = navigator.connection; return !!c && c.type === 'wifi' && !c.saveData; };
+  var CLE_AUTO = 'loue_carnet_auto_' + (CONFIG.env || 'prod');
+  C.autoActif = function () { try { return localStorage.getItem(CLE_AUTO) !== 'non'; } catch (e) { return true; } };
+  C.reglerAuto = function (oui) { try { localStorage.setItem(CLE_AUTO, oui ? 'oui' : 'non'); } catch (e) {} };
+  // Le téléchargement AUTOMATIQUE (page Carnet, en Wi-Fi) ne remplit pas le téléphone tout seul : il s'arrête quand le
+  // carnet atteint cette taille ; au-delà, c'est la personne qui appuie sur « Tout télécharger ».
+  C.AUTO_MAX = 150 * Mo;
+  // Des fiches attendent-elles d'être envoyées ? (le téléchargement automatique leur laisse la place et le serveur)
+  C.fichesEnAttente = function () {
+    if (!LOUE.stockage || !LOUE.stockage.tout) return Promise.resolve(0);
+    return LOUE.stockage.tout('file').then(function (l) { return (l || []).filter(function (e) { return e.etat !== 'erreur'; }).length; }).catch(function () { return 0; });
   };
 })();

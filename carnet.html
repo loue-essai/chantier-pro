@@ -10,8 +10,8 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Loué App">
 <meta name="theme-color" content="#1A2B4A">
-<link rel="stylesheet" href="commun/style.css?v=1d0137fb63">
-<link rel="stylesheet" href="commun/fiche.css?v=1d0137fb63">
+<link rel="stylesheet" href="commun/style.css?v=22c6875416">
+<link rel="stylesheet" href="commun/fiche.css?v=22c6875416">
 <style>
 [hidden]{display:none!important;}
 .docs{background:var(--card);border:1px solid var(--border);border-radius:var(--rl);overflow:hidden;}
@@ -25,6 +25,16 @@
 .doc-etat{font-size:14px;font-weight:700;margin-top:4px;}
 .doc-etat.garde{color:var(--green);}
 .doc.ancien{background:#FDF1F1;}
+.doc-etat.alerte{color:var(--red);}
+.doc-bloc{border-bottom:1px solid var(--border);}
+.doc-bloc:last-child{border-bottom:none;}
+.doc-bloc .doc{border-bottom:none;}
+.dl{display:block;width:calc(100% - 28px);margin:0 14px 14px;min-height:52px;border-radius:10px;border:2px solid #1A2B4A;background:#fff;color:#1A2B4A;font:inherit;font-size:16px;font-weight:800;cursor:pointer;padding:8px 12px;}
+.dl.en-cours{background:linear-gradient(to right,#CFE0FA var(--fait,0%),#fff var(--fait,0%));}
+.dl:disabled{opacity:.45;}
+#dl-tout{width:100%;margin:0 0 12px;}
+.auto-wifi{display:flex;align-items:center;gap:10px;min-height:48px;font-size:15px;margin:0 0 12px;}
+.auto-wifi input{width:24px;height:24px;}
 .doc-ancien{font-size:15px;font-weight:800;color:var(--red);margin-top:4px;}
 /* ── Visionneuse : plein écran, fond sombre (lisible en plein soleil), gros boutons ── */
 #vue{position:fixed;inset:0;z-index:50;background:#2B2F36;display:flex;flex-direction:column;}
@@ -55,6 +65,8 @@ body.loue-test #vue{top:40px;}   /* sous le bandeau du mode test */
 <div class="main">
   <div class="aide" id="entete"></div>
   <div class="listes-info" id="info" role="status"></div>
+  <button class="dl" type="button" id="dl-tout" onclick="toutTelecharger()" hidden></button>
+  <label class="auto-wifi" id="auto-wifi" hidden><input type="checkbox" id="auto-wifi-case" data-brouillon="non" onchange="CARNET.reglerAuto(this.checked)"> Télécharger les plans tout seul quand le téléphone est en Wi-Fi</label>
   <div class="docs" id="docs" hidden></div>
   <div class="aide" id="place" hidden></div>
 </div>
@@ -79,11 +91,11 @@ body.loue-test #vue{top:40px;}   /* sous le bandeau du mode test */
   </div>
 </div>
 
-<script src="commun/config.js?v=1d0137fb63"></script>
-<script src="commun/api.js?v=1d0137fb63"></script>
-<script src="commun/ui.js?v=1d0137fb63"></script>
-<script src="commun/carnet.js?v=1d0137fb63"></script>
-<script src="commun/hors-ligne.js?v=1d0137fb63"></script>
+<script src="commun/config.js?v=22c6875416"></script>
+<script src="commun/api.js?v=22c6875416"></script>
+<script src="commun/ui.js?v=22c6875416"></script>
+<script src="commun/carnet.js?v=22c6875416"></script>
+<script src="commun/hors-ligne.js?v=22c6875416"></script>
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
@@ -107,6 +119,7 @@ function pasDeCompte(message) {
 }
 
 function charger() {
+  if (TELE) { $('info').textContent = 'Téléchargement en cours : arrêtez-le pour actualiser la liste.'; return; }
   const moi = ++enCours;
   // Session terminée du même compte : ce qui est gardé dans le téléphone reste lisible ; sans compte du tout : rien
   const SESSION = !LOUE.compte();
@@ -124,9 +137,18 @@ function charger() {
       : r.horsReseau ? '📴 Pas de réseau : ' + du
       : r.message ? '⚠ ' + r.message + (/[.!?…]$/.test(r.message) ? '' : '.') + ' En attendant, ' + du
       : (DOCS.length ? '' : 'Aucun document dans le carnet de ce chantier pour l’instant.');
-    return afficherListe();
+    LISTE_FRAICHE = !r.horsReseau && !r.message && !SESSION;
+    return afficherListe().then(() => {
+      if (!LISTE_FRAICHE) return;
+      // iPhone (et tout téléphone qui ne dit pas s'il est en Wi-Fi) : on propose, on ne lance rien
+      const nouveaux = DOCS.filter(d => !d.ancien && document.querySelector('#docs .dl[data-dl="' + d.id + '"]')
+        && (DOCS.some(a => a.ancien && a.code === d.code) || (lireVus()[d.code || d.id] && lireVus()[d.code || d.id] !== d.id)));
+      if (nouveaux.length && !CARNET.wifi()) $('info').textContent = '● Nouvel indice : ' + nouveaux.map(d => d.intitule || d.id).join(', ') + '. Téléchargez-le (bouton ⬇) dès que vous êtes en Wi-Fi.';
+      autoWifi();
+    });
   }).catch(err => {
     if (moi !== enCours) return;
+    LISTE_FRAICHE = false;
     $('docs').hidden = true;
     $('info').textContent = SESSION ? '🔑 Session terminée : reconnectez-vous à l’accueil pour voir le carnet de ce chantier.'
       : err && err.reponse && err.reponse.message ? '⚠ ' + err.reponse.message
@@ -136,9 +158,12 @@ function charger() {
 
 function afficherListe() {
   const zone = $('docs'), vus = lireVus();
-  return Promise.all(DOCS.map(d => CARNET.etat(CHANTIER, d.id))).then(etats => {
+  return Promise.all(DOCS.map(d => Promise.all([CARNET.etat(CHANTIER, d.id), CARNET.bilan(CHANTIER, d)]))).then(lus => {
+    const etats = lus.map(x => x[0]), bilans = lus.map(x => x[1]);
     zone.textContent = '';
+    let resteTout = 0;
     DOCS.forEach((d, i) => {
+      const bloc = el('div', 'doc-bloc');
       const b = el('button', 'doc' + (d.ancien ? ' ancien' : '')); b.type = 'button'; b.dataset.doc = d.id;
       const t = el('div', 'doc-titre', d.intitule || d.id);
       if (d.indice) t.appendChild(el('span', 'doc-indice', 'indice ' + d.indice));
@@ -150,18 +175,122 @@ function afficherListe() {
       if (d.ancien) b.appendChild(el('div', 'doc-ancien', '⚠ ANCIEN INDICE — l’indice ' + (d.remplacePar || 'suivant') + ' est sorti : ouvrez-le dès que vous avez du réseau.'));
       const n = (d.pages || []).length;
       b.appendChild(el('div', 'doc-detail', [d.code, dateFr(d.date), n + (n > 1 ? ' pages' : ' page'), poids(d.poids || 0)].filter(Boolean).join(' · ')));
-      const gardees = Object.keys(etats[i].pages).length;
-      b.appendChild(el('div', 'doc-etat' + (gardees ? ' garde' : ''), gardees >= n ? '✓ déjà ouvert : lisible sans réseau (zones déjà regardées)'
+      const gardees = Object.keys(etats[i].pages).length, bl = bilans[i], reste = Math.max(0, bl.octets - bl.octetsGardes);
+      const perdu = bl.etaitComplet && !bl.complet;
+      b.appendChild(el('div', 'doc-etat' + (perdu ? ' alerte' : bl.complet || gardees ? ' garde' : ''),
+        bl.complet ? '✓ disponible sans réseau, en entier'
+        : perdu ? '⚠ plus disponible en entier sans réseau : le téléphone a fait de la place.' + (d.ancien ? '' : ' Téléchargez-le de nouveau.')
+        : gardees >= n ? '✓ déjà ouvert : lisible sans réseau aux endroits déjà regardés'
         : gardees ? '✓ ' + gardees + ' page' + (gardees > 1 ? 's' : '') + ' sur ' + n + ' déjà ouverte' + (gardees > 1 ? 's' : '') + ' ; le reste demande du réseau'
         : '📶 demande du réseau à la première ouverture'));
       b.onclick = () => ouvrirDoc(d.id, 1);
-      zone.appendChild(b);
+      bloc.appendChild(b);
+      // « Tout télécharger » : pas pour un ancien indice, pas quand tout y est déjà
+      if (LISTE_FRAICHE && !d.ancien && !bl.complet && bl.total) {
+        resteTout += reste;
+        const t = el('button', 'dl'); t.type = 'button'; t.dataset.dl = d.id; t.dataset.reste = reste;
+        t.onclick = () => (TELE && TELE.id === d.id ? arreterTelechargement() : telecharger([d.id]));
+        bloc.appendChild(t);
+      }
+      zone.appendChild(bloc);
     });
     zone.hidden = !DOCS.length;
+    RESTE_TOUT = resteTout;
+    $('auto-wifi').hidden = !(CARNET.saitWifi() && DOCS.length);
+    $('auto-wifi-case').checked = CARNET.autoActif();
+    peindreTelechargement();
     return CARNET.occupation();
   }).then(o => {
     $('place').hidden = !o;
     $('place').textContent = 'Plans gardés dans ce téléphone : ' + poids(o || 0) + '. Les plus anciens sont effacés tout seuls quand la place manque ; les fiches et les brouillons passent toujours avant.';
+  });
+}
+
+// ════════════════ Tout télécharger (lot 4b) ════════════════
+// Un document à la fois, une demande à la fois. L'écran est gardé allumé pendant le téléchargement (une appli web ne
+// travaille pas en arrière-plan) ; s'il est interrompu, il reprend où il en était au prochain appui.
+let TELE = null;          // { id, fait, total, file: [identifiants restants], auto }
+let RESTE_TOUT = 0;
+let verrouEcran = null, ecranVoulu = false, verrouDemande = false;
+let LISTE_FRAICHE = false;   // la liste affichée vient du serveur, à l'instant (sinon : pas de téléchargement)
+let AUTO_ARRETE = false;     // la personne a arrêté un téléchargement automatique : il ne repart pas tout seul pendant cette visite
+function ecranAllume(oui) {
+  ecranVoulu = oui;
+  try {
+    if (oui && navigator.wakeLock && !verrouEcran && !verrouDemande && document.visibilityState === 'visible') {
+      verrouDemande = true;
+      navigator.wakeLock.request('screen').then(v => {
+        verrouDemande = false;
+        if (!ecranVoulu) { v.release().catch(() => {}); return; }   // obtenu trop tard : le téléchargement est déjà fini
+        verrouEcran = v;
+        v.addEventListener('release', () => { if (verrouEcran === v) verrouEcran = null; });   // le téléphone l'a repris (appli quittée)
+      }).catch(() => { verrouDemande = false; });
+    } else if (!oui && verrouEcran) { const v = verrouEcran; verrouEcran = null; v.release().catch(() => {}); }
+  } catch (e) {}
+}
+// le téléphone rend l'écran dès qu'on quitte l'appli : on le redemande au retour, si un téléchargement tourne encore
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && TELE) ecranAllume(true); });
+// Le texte des boutons, d'après ce qui est en cours
+function peindreTelechargement() {
+  document.querySelectorAll('#docs .dl').forEach(t => {
+    const actif = TELE && TELE.id === t.dataset.dl;
+    const pc = actif && TELE.total ? Math.min(100, Math.floor(TELE.fait * 100 / TELE.total)) : 0;
+    t.classList.toggle('en-cours', !!actif);
+    t.style.setProperty('--fait', pc + '%');
+    t.disabled = !!TELE && !actif;
+    t.textContent = actif ? (TELE.arret ? 'Arrêt en cours…' : '⏸ Arrêter — ' + pc + ' % téléchargé') : '⬇ Tout télécharger (' + poids(Number(t.dataset.reste) || 0) + ')';
+  });
+  const tout = $('dl-tout'), plusieurs = document.querySelectorAll('#docs .dl').length > 1;
+  tout.hidden = !plusieurs && !(TELE && TELE.tous);
+  tout.classList.toggle('en-cours', !!(TELE && TELE.tous));
+  tout.textContent = TELE && TELE.tous ? (TELE.arret ? 'Arrêt en cours…' : '⏸ Arrêter le téléchargement du chantier') : '⬇ Tout télécharger pour ce chantier (' + poids(RESTE_TOUT) + ')';
+  tout.disabled = !!TELE && !TELE.tous;
+}
+function toutTelecharger() {
+  if (TELE) { if (TELE.tous) arreterTelechargement(); return; }
+  telecharger(Array.from(document.querySelectorAll('#docs .dl')).map(t => t.dataset.dl), true);
+}
+function arreterTelechargement() { if (TELE) { TELE.file = []; TELE.arret = true; if (TELE.auto) AUTO_ARRETE = true; } CARNET.arreterTelechargement(); peindreTelechargement(); }
+// ids : les documents à télécharger, dans l'ordre ; tous : lancé par le bouton du chantier ; auto : lancé tout seul en Wi-Fi
+function telecharger(ids, tous, auto) {
+  if (TELE || CARNET.telechargementEnCours()) return Promise.resolve();
+  TELE = { id: '', fait: 0, total: 0, file: ids.slice(), tous: !!tous, auto: !!auto };
+  const moi = TELE;
+  ecranAllume(true);
+  const suivant = () => {
+    const id = moi.file.shift(), d = id && DOCS.filter(x => x.id === id)[0];
+    if (!id || moi.arret) return Promise.resolve({ fini: !moi.arret, arrete: moi.arret });
+    if (!d || d.ancien) return suivant();
+    moi.id = id; moi.fait = 0; moi.total = 0; peindreTelechargement();
+    return CARNET.telecharger(CHANTIER, d, (fait, total) => { moi.fait = fait; moi.total = total; peindreTelechargement(); }).then(r => (r.fini ? suivant() : r));
+  };
+  return suivant().then(r => {
+    TELE = null; ecranAllume(false);
+    let message;
+    if (r.fini) message = '✓ Téléchargement terminé : ces plans sont lisibles sans réseau.';
+    else if (r.arrete) message = 'Téléchargement arrêté. Appuyez de nouveau pour le reprendre où il en est.';
+    else if (r.plein && r.avant) message = '⚠ Pas assez de place : il reste ' + poids(r.besoin) + ' à télécharger, et le carnet de ce téléphone n’a plus que ' + poids(r.place)
+      + ' (les plans déjà téléchargés en entier sont gardés). Rien n’a été effacé.';
+    else if (r.plein) message = '⚠ Plus de place pour les plans dans ce téléphone : le téléchargement s’est arrêté. Les plans déjà téléchargés en entier restent lisibles.';
+    else if (r.reponse && (r.reponse.code === 'CARNET_INCONNU' || r.reponse.code === 'INTERDIT' || r.reponse.code === 'COMPTE_REFUSE')) return charger();
+    else message = '⚠ ' + (r.erreur || 'Pas de réseau.') + (/[.!?…]$/.test(r.erreur || '.') ? '' : '.') + ' Appuyez de nouveau pour reprendre où il en est.';
+    return afficherListe().then(() => { $('info').textContent = message; });
+  });
+}
+// En Wi-Fi (Android), les plans incomplets du chantier ouvert se téléchargent tout seuls, si la case est cochée
+function autoWifi() {
+  const c = LOUE.compte();
+  if (TELE || AUTO_ARRETE || !CARNET.wifi() || !CARNET.autoActif() || !c || c.profil.conducteur || c.profil.tous) return;
+  const boutons = Array.from(document.querySelectorAll('#docs .dl'));
+  if (!boutons.length) return;
+  Promise.all([CARNET.occupation(), CARNET.fichesEnAttente()]).then(lus => {
+    if (TELE || AUTO_ARRETE || lus[1] > 0) return;   // des fiches attendent : elles passent d'abord
+    // seulement ce qui tient sous la limite de l'automatique ; le reste attend un appui sur « Tout télécharger »
+    let place = CARNET.AUTO_MAX - lus[0];
+    const ids = boutons.filter(t => { const o = Number(t.dataset.reste) || 0; if (o > place) return false; place -= o; return true; }).map(t => t.dataset.dl);
+    if (!ids.length) return;
+    $('info').textContent = '📶 Wi-Fi : les plans de ce chantier se téléchargent tout seuls. Gardez l’appli ouverte.';
+    telecharger(ids, true, true);
   });
 }
 
