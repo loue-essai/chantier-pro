@@ -153,22 +153,6 @@
     });
   };
 
-  // Lot 8 — note de réunion : message de fin d'envoi. Le compte rendu se désigne par sa date de réunion.
-  // rep : la réponse du serveur ; date : la date de réunion de la note (« 06/11/2026 »).
-  LOUE.messageNoteEnvoyee = function (rep, date) {
-    var d = (rep && rep.data) || {}, deja = !!rep && rep.code === 'DEJA_RECU';
-    var sansMail = d.envoyes === 0 && !d.reportes && !deja;
-    var reportes = d.reportes ? d.reportes + (d.reportes > 1 ? ' mails reportés' : ' mail reporté') + ' à plus tard (quota du jour)' : '';
-    var mails = typeof d.envoyes !== 'number' ? '' : d.envoyes === 0 && reportes ? reportes
-      : d.envoyes + (d.envoyes > 1 ? ' mails envoyés' : ' mail envoyé') + (reportes ? ', ' + reportes : '');
-    var quoi = 'Compte rendu' + (date ? ' du ' + date : '');
-    var texte;
-    if (sansMail) texte = '⚠ ' + quoi + ' enregistré, mais aucun mail n’est parti';
-    else if (deja) texte = '✓ ' + quoi + ' déjà reçu par le bureau';
-    else texte = '✓ ' + quoi + ' envoyé' + (mails ? ' — ' + mails : '');
-    return { texte: texte, duree: sansMail ? 10000 : 8000 };
-  };
-
   if (LOUE.surEvenement) {
     LOUE.surEvenement(function (ev) {
       if (ev.type === 'file') majIndicateur(ev.liste);
@@ -176,7 +160,6 @@
       var estNote = !!ev.element && /^note-/.test(ev.element.type || '');
       if (ev.type === 'envoyee' && estNote) { LOUE.message(ev.element.type === 'note-chantier' ? '✓ Ajouté à la liste' : '✓ ' + ev.element.libelle, 2500); return; }
       if (ev.type === 'erreur' && estNote) { LOUE.message('⚠ Pas enregistré dans la liste du chantier : ' + ev.element.message + ' (détail : indicateur en haut de l’écran)', 8000); return; }
-      if (ev.type === 'envoyee' && ev.element && ev.element.type === 'note') { var m = LOUE.messageNoteEnvoyee(ev.reponse, (ev.element.donnees || {}).date); LOUE.message(m.texte, m.duree); return; }
       if (ev.type === 'envoyee') {
         var d = (ev.reponse && ev.reponse.data) || {};
         var sansMail = d.envoyes === 0 && !d.reportes && ev.reponse.code !== 'DEJA_RECU';
